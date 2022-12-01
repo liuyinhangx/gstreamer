@@ -1,7 +1,6 @@
 msdk_sources = [
   'gstmsdk.c',
   'gstmsdkallocator.c',
-  'gstmsdkbufferpool.c',
   'gstmsdkcaps.c',
   'gstmsdkcontext.c',
   'gstmsdkcontextutil.c',
@@ -16,9 +15,7 @@ msdk_sources = [
   'gstmsdkmjpegenc.c',
   'gstmsdkmpeg2dec.c',
   'gstmsdkmpeg2enc.c',
-  'gstmsdksystemmemory.c',
   'gstmsdkvc1dec.c',
-  'gstmsdkvideomemory.c',
   'gstmsdkvp8dec.c',
   'gstmsdkvpp.c',
   'gstmsdkvpputil.c',
