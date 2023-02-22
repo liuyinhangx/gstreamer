@@ -941,9 +941,8 @@ gst_msdkcaps_enc_create_caps (MsdkSession * session,
   raw_fmts = _enc_get_raw_formats (codec_id);
   if (!raw_fmts)
     goto failed;
-  dma_caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      dma_fmts);
+  raw_caps_str = g_strdup_printf ("video/x-raw, format=(string){ %s }",
+      raw_fmts);
   in_caps = gst_caps_from_string (raw_caps_str);
   g_free (raw_caps_str);
 
