@@ -33,6 +33,7 @@
 
 #define DEFAULT_DELIMITER ", "
 #define PROFILE_DELIMITER DEFAULT_DELIMITER
+#define FORMAT_DELIMITER  DEFAULT_DELIMITER
 
 #define DEFAULT_VIDEO_FORMAT GST_VIDEO_FORMAT_NV12
 
@@ -176,6 +177,128 @@ _list_append_string (GValue * list, const gchar * str)
 
   gst_value_list_append_value (list, &gval);
   g_value_unset (&gval);
+}
+
+static gboolean
+_strings_to_list (const gchar * strings, GValue * list)
+{
+  gchar **strs = NULL;
+
+  if (!strings || !list)
+    return FALSE;
+
+  strs = g_strsplit (strings, DEFAULT_DELIMITER, 0);
+  for (guint i = 0; strs[i]; i++)
+    _list_append_string (list, strs[i]);
+  g_strfreev (strs);
+
+  return TRUE;
+}
+
+static gboolean
+_caps_append_formats (GstCaps * caps,
+    const gchar * features, const GValue * fmts)
+{
+  guint size = gst_caps_get_size (caps);
+  GstStructure *s = NULL;
+
+  if (features) {
+    GValue caps_fmts = G_VALUE_INIT;
+    GstCapsFeatures *f = gst_caps_features_from_string (features);
+
+    for (guint i = 0; i < size; i++) {
+      if (gst_caps_features_is_equal (f, gst_caps_get_features (caps, i))) {
+        s = gst_caps_get_structure (caps, i);
+        break;
+      }
+    }
+
+    if (!s)
+      return FALSE;
+
+    gst_value_list_concat (&caps_fmts,
+        gst_structure_get_value (s, "format"), fmts);
+    gst_structure_set_value (s, "format", &caps_fmts);
+  } else {
+    for (guint i = 0; i < size; i++) {
+      GValue caps_fmts = G_VALUE_INIT;
+      s = gst_caps_get_structure (caps, i);
+      gst_value_list_concat (&caps_fmts,
+          gst_structure_get_value (s, "format"), fmts);
+      gst_structure_set_value (s, "format", &caps_fmts);
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+_caps_append_formats_no_check (GstCaps * caps,
+    const gchar * features, const gchar * fmts_str)
+{
+  GValue fmts = G_VALUE_INIT;
+
+  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
+  g_return_val_if_fail (features != NULL, FALSE);
+  g_return_val_if_fail (fmts_str != NULL, FALSE);
+
+  g_value_init (&fmts, GST_TYPE_LIST);
+  _strings_to_list (fmts_str, &fmts);
+
+  _caps_append_formats (caps, features, &fmts);
+  g_value_unset (&fmts);
+
+  return TRUE;
+}
+
+static gboolean
+_caps_set_formats (GstCaps * caps,
+    const gchar * features, const GValue * fmts)
+{
+  guint size = gst_caps_get_size (caps);
+  GstStructure *s = NULL;
+
+  if (features) {
+    GstCapsFeatures *f = gst_caps_features_from_string (features);
+
+    for (guint i = 0; i < size; i++) {
+      if (gst_caps_features_is_equal (f, gst_caps_get_features (caps, i))) {
+        s = gst_caps_get_structure (caps, i);
+        break;
+      }
+    }
+
+    if (!s)
+      return FALSE;
+
+    gst_structure_set_value (s, "format", fmts);
+  } else {
+    for (guint i = 0; i < size; i++) {
+      s = gst_caps_get_structure (caps, i);
+      gst_structure_set_value (s, "format", fmts);
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+_caps_set_formats_no_check (GstCaps * caps,
+    const gchar * features, const gchar * fmts_str)
+{
+  GValue fmts = G_VALUE_INIT;
+
+  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
+  g_return_val_if_fail (features != NULL, FALSE);
+  g_return_val_if_fail (fmts_str != NULL, FALSE);
+
+  g_value_init (&fmts, GST_TYPE_LIST);
+  _strings_to_list (fmts_str, &fmts);
+
+  _caps_set_formats (caps, features, &fmts);
+  g_value_unset (&fmts);
+
+  return TRUE;
 }
 
 static const gchar *
@@ -795,6 +918,130 @@ failed:
   return FALSE;
 }
 
+static gboolean
+_enc_is_fourcc_in_desc (mfxEncoderDescription * enc_desc,
+    gint c, mfxU32 fourcc, mfxU16 * profile)
+{
+  for (guint p = 0; p < enc_desc->Codecs[c].NumProfiles; p++) {
+    for (guint f = 0;
+          f < enc_desc->Codecs[c].Profiles[p].MemDesc->NumColorFormats; f++) {
+      if (enc_desc->Codecs[c].Profiles[p].MemDesc->ColorFormats[f] != fourcc) {
+        *profile = enc_desc->Codecs[c].Profiles[p].Profile;
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
+}
+
+static void
+_enc_get_supported_external_formats (MsdkSession * session,
+    mfxEncoderDescription * enc_desc, guint codec_id,
+    gchar ** fmts_str_arr, GValue * fmts)
+{
+  gint c;
+  mfxVideoParam in, out;
+
+  _codec_init_param (&in, codec_id, ENC_IOPATTERN, DEFAULT_VIDEO_FORMAT);
+  if (codec_id == MFX_CODEC_AV1)
+    in.mfx.CodecLevel = MFX_LEVEL_AV1_41;
+  out = in;
+
+  c = _enc_get_codec_index (enc_desc, codec_id);
+  for (guint i = 0; fmts_str_arr[i]; i++) {
+    GstVideoFormat fmt = gst_video_format_from_string (fmts_str_arr[i]);
+    mfxU32 fourcc = gst_msdk_get_mfx_fourcc_from_format (fmt);
+
+    if (_enc_is_fourcc_in_desc (enc_desc, c, fourcc, &in.mfx.CodecProfile) &&
+          _enc_is_format_supported (session, codec_id, fmt, &in, &out)) {
+      _list_append_string (fmts, gst_video_format_to_string (fmt));
+    }
+  }
+}
+
+gboolean
+gst_msdkcaps_enc_append_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check)
+{
+  mfxImplDescription *desc;
+  GValue fmts = G_VALUE_INIT;
+  gchar **fmts_str_arr = NULL;
+
+  if (!need_check)
+    return _caps_append_formats_no_check (caps, features, fmts_str);
+
+  g_return_val_if_fail (session != NULL, FALSE);
+  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
+  g_return_val_if_fail (features != NULL, FALSE);
+  g_return_val_if_fail (fmts_str != NULL, FALSE);
+
+  fmts_str_arr = g_strsplit (fmts_str, FORMAT_DELIMITER, 0);
+  if (!fmts_str_arr)
+    goto failed;
+
+  g_value_init (&fmts, GST_TYPE_LIST);
+  desc = (mfxImplDescription *) msdk_get_impl_description (session);
+  if (!desc)
+    goto failed;
+
+  _enc_get_supported_external_formats (session,
+      &desc->Enc, codec_id, fmts_str_arr, &fmts);
+
+  msdk_release_impl_description (session, desc);
+  g_strfreev (fmts_str_arr);
+
+  _caps_append_formats (caps, features, &fmts);
+  g_value_unset (&fmts);
+
+  return TRUE;
+
+failed:
+  return FALSE;
+}
+
+gboolean
+gst_msdkcaps_enc_set_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check)
+{
+  mfxImplDescription *desc;
+  GValue fmts = G_VALUE_INIT;
+  gchar **fmts_str_arr = NULL;
+
+  if (!need_check)
+    return _caps_set_formats_no_check (caps, features, fmts_str);
+
+  g_return_val_if_fail (session != NULL, FALSE);
+  g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
+  g_return_val_if_fail (features != NULL, FALSE);
+  g_return_val_if_fail (fmts_str != NULL, FALSE);
+
+  fmts_str_arr = g_strsplit (fmts_str, FORMAT_DELIMITER, 0);
+  if (!fmts_str_arr)
+    goto failed;
+
+  g_value_init (&fmts, GST_TYPE_LIST);
+  desc = (mfxImplDescription *) msdk_get_impl_description (session);
+  if (!desc)
+    goto failed;
+
+  _enc_get_supported_external_formats (session,
+      &desc->Enc, codec_id, fmts_str_arr, &fmts);
+
+  msdk_release_impl_description (session, desc);
+  g_strfreev (fmts_str_arr);
+
+  _caps_set_formats (caps, features, &fmts);
+  g_value_unset (&fmts);
+
+  return TRUE;
+
+failed:
+  return FALSE;
+}
+
 #else
 
 static gboolean
@@ -953,6 +1200,22 @@ failed:
   GST_WARNING ("Failed to create caps for %"GST_FOURCC_FORMAT" ENC",
       GST_FOURCC_ARGS (codec_id));
   return FALSE;
+}
+
+gboolean
+gst_msdkcaps_enc_append_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check)
+{
+  return _caps_append_formats_no_check (caps, features, fmts_str);
+}
+
+gboolean
+gst_msdkcaps_enc_set_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check)
+{
+  return _caps_set_formats_no_check (caps, features, fmts_str);
 }
 
 #endif

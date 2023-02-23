@@ -46,6 +46,16 @@ gst_msdkcaps_enc_create_caps (MsdkSession * session,
     gpointer enc_description, guint codec_id,
     GstCaps ** sink_caps, GstCaps ** src_caps);
 
+gboolean
+gst_msdkcaps_enc_append_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check);
+
+gboolean
+gst_msdkcaps_enc_set_formats (MsdkSession * session,
+    GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check);
+
 G_END_DECLS
 
 #endif /* __GST_MSDKCAPS_H__ */
