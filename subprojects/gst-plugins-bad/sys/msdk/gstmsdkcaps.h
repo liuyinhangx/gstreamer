@@ -56,6 +56,11 @@ gst_msdkcaps_enc_set_formats (MsdkSession * session,
     GstCaps * caps, guint codec_id,
     const gchar * features, const gchar * fmts_str, gboolean need_check);
 
+void
+gst_msdkcaps_pad_template_init (GstElementClass * klass,
+    GstCaps * sink_caps, GstCaps * src_caps,
+    const gchar * doc_sink_caps_str, const gchar * doc_src_caps_str);
+
 G_END_DECLS
 
 #endif /* __GST_MSDKCAPS_H__ */
