@@ -52,6 +52,10 @@ gst_msdkcaps_dec_create_caps (MsdkSession * session,
     GstCaps ** sink_caps, GstCaps ** src_caps);
 
 gboolean
+gst_msdkcaps_vpp_create_caps (MsdkSession * session,
+    gpointer vpp_description, GstCaps ** sink_caps, GstCaps ** src_caps);
+
+gboolean
 gst_msdkcaps_enc_append_formats (MsdkSession * session,
     GstCaps * caps, guint codec_id,
     const gchar * features, const gchar * fmts_str, gboolean need_check);
@@ -59,6 +63,11 @@ gst_msdkcaps_enc_append_formats (MsdkSession * session,
 gboolean
 gst_msdkcaps_dec_append_formats (MsdkSession * session,
     GstCaps * caps, guint codec_id,
+    const gchar * features, const gchar * fmts_str, gboolean need_check);
+
+gboolean
+gst_msdkcaps_vpp_append_formats (MsdkSession * session,
+    GstPadDirection direction, GstCaps * caps,
     const gchar * features, const gchar * fmts_str, gboolean need_check);
 
 gboolean
@@ -70,6 +79,15 @@ gboolean
 gst_msdkcaps_dec_set_formats (MsdkSession * session,
     GstCaps * caps, guint codec_id,
     const gchar * features, const gchar * fmts_str, gboolean need_check);
+
+gboolean
+gst_msdkcaps_vpp_set_formats (MsdkSession * session,
+    GstPadDirection direction, GstCaps * caps,
+    const gchar * features, const gchar * fmts_str, gboolean need_check);
+
+gboolean
+gst_msdkcaps_set_strings (GstCaps * caps,
+    const gchar * features, const char * field, const gchar * strings);
 
 void
 gst_msdkcaps_pad_template_init (GstElementClass * klass,
