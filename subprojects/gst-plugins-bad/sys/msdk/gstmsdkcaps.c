@@ -1744,7 +1744,7 @@ gst_msdkcaps_enc_set_formats (MsdkSession * session,
   gchar **fmts_str_arr = NULL;
 
   if (!need_check)
-    return _caps_set_formats_no_check (caps, features, fmts_str);
+    return _caps_append_formats_no_check (caps, features, fmts_str);
 
   g_return_val_if_fail (session != NULL, FALSE);
   g_return_val_if_fail (GST_IS_CAPS (caps), FALSE);
@@ -2273,7 +2273,7 @@ gst_msdkcaps_vpp_append_formats (MsdkSession * session,
     GstPadDirection direction, GstCaps * caps,
     const gchar * features, const gchar * fmts_str, gboolean need_check)
 {
-  return _caps_set_formats_no_check (caps, features, fmts_str);
+  return _caps_append_formats_no_check (caps, features, fmts_str);
 }
 
 gboolean
