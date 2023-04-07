@@ -55,7 +55,8 @@ struct _GstMsdkVP9DecClass
 
 gboolean
 gst_msdkvp9dec_register (GstPlugin * plugin,
-    MsdkSession * session, GstCaps * sink_caps, GstCaps * src_caps, guint rank);
+    GstMsdkContext * context, GstCaps * sink_caps,
+    GstCaps * src_caps, guint rank);
 
 G_END_DECLS
 

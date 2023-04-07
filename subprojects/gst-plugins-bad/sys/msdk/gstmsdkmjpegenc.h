@@ -52,7 +52,8 @@ struct _GstMsdkMJPEGEncClass
 
 gboolean
 gst_msdkmjpegenc_register (GstPlugin * plugin,
-    MsdkSession * session, GstCaps * sink_caps, GstCaps * src_caps, guint rank);
+    GstMsdkContext * context, GstCaps * sink_caps,
+    GstCaps * src_caps, guint rank);
 
 G_END_DECLS
 

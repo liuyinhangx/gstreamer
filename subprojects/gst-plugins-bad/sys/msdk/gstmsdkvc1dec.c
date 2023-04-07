@@ -226,7 +226,8 @@ gst_msdkvc1dec_init (GTypeInstance * instance, gpointer g_class)
 
 gboolean
 gst_msdkvc1dec_register (GstPlugin * plugin,
-    MsdkSession * session, GstCaps * sink_caps, GstCaps * src_caps, guint rank)
+    GstMsdkContext * context, GstCaps * sink_caps,
+    GstCaps * src_caps, guint rank)
 {
   GType type;
   MsdkDecCData *cdata;

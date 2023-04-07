@@ -31,6 +31,11 @@
 
 #include "gstmsdkcaps.h"
 
+//#include <drm_fourcc.h>
+#include <libdrm/drm_fourcc.h>
+#include "msdk_libva.h"
+#include <gst/va/gstvavideoformat.h>
+
 #define DEFAULT_DELIMITER ", "
 #define PROFILE_DELIMITER DEFAULT_DELIMITER
 
@@ -148,7 +153,7 @@ typedef struct
   guint max_height;
 } ResolutionRange;
 
-typedef gboolean (*IsParamSupportedFunc) (MsdkSession * session,
+typedef gboolean (*IsParamSupportedFunc) (mfxSession * session,
     mfxVideoParam * in, mfxVideoParam * out);
 
 gboolean
@@ -208,6 +213,215 @@ _get_media_type (guint codec)
   }
 
   return NULL;
+}
+
+static guint64
+_get_modifier (GstMsdkContext * context,
+    guint usage_hint, guint va_format, guint va_fourcc)
+{
+  VAStatus status;
+  VASurfaceID surface;
+  VASurfaceAttrib attribs[2];
+  guint num_attribs = 0;
+  uint32_t flags = VA_EXPORT_SURFACE_SEPARATE_LAYERS |
+      VA_EXPORT_SURFACE_READ_WRITE;
+
+  VADRMPRIMESurfaceDescriptor desc = { 0 };
+  gpointer dpy = gst_msdk_context_get_handle (context);
+
+  attribs[num_attribs].type = VASurfaceAttribPixelFormat;
+  attribs[num_attribs].flags = VA_SURFACE_ATTRIB_SETTABLE;
+  attribs[num_attribs].value.type = VAGenericValueTypeInteger;
+  attribs[num_attribs].value.value.i = va_fourcc;
+  num_attribs += 1;
+  attribs[num_attribs].type = VASurfaceAttribUsageHint;
+  attribs[num_attribs].flags = VA_SURFACE_ATTRIB_SETTABLE;
+  attribs[num_attribs].value.type = VAGenericValueTypeInteger;
+  attribs[num_attribs].value.value.i = usage_hint;
+  num_attribs += 1;
+
+  status = vaCreateSurfaces (dpy, va_format, 64, 64, &surface, 1,
+      attribs, num_attribs);
+  if (VA_STATUS_SUCCESS != status) {
+    GST_WARNING ("Failed to create VA surefaces");
+    return DRM_FORMAT_MOD_INVALID;
+  }
+
+  status = vaExportSurfaceHandle (dpy, surface,
+      VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, flags, &desc);
+  vaDestroySurfaces (dpy, &surface, 1);
+  if (VA_STATUS_SUCCESS != status) {
+    GST_WARNING ("Failed to export surface handle");
+    return DRM_FORMAT_MOD_INVALID;
+  }
+
+  return desc.objects[0].drm_format_modifier;
+}
+
+static void
+_get_modifiers (GstMsdkContext * context,
+    guint usage_hint, GstVideoFormat fmt, GValue * modifiers)
+{
+  guint64 mod = DRM_FORMAT_MOD_INVALID;
+  guint64 mod_gen = DRM_FORMAT_MOD_INVALID;
+  GValue gmod = G_VALUE_INIT;
+
+  gint mfx_chroma = gst_msdk_get_mfx_chroma_from_format (fmt);
+  gint mfx_fourcc = gst_msdk_get_mfx_fourcc_from_format (fmt);
+  guint va_format = gst_msdk_get_va_rt_format_from_mfx_rt_format (mfx_chroma);
+  guint va_fourcc = gst_msdk_get_va_fourcc_from_mfx_fourcc (mfx_fourcc);
+
+  g_value_init (&gmod, G_TYPE_UINT64);
+
+  mod = _get_modifier (context, usage_hint, va_format, va_fourcc);
+  if (mod != DRM_FORMAT_MOD_INVALID && mod != DRM_FORMAT_MOD_LINEAR) {
+    g_value_set_uint64 (&gmod, mod);
+    gst_value_list_append_value (modifiers, &gmod);
+  }
+
+  if (usage_hint != VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC) {
+    mod_gen = _get_modifier (context,
+        VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC, va_format, va_fourcc);
+    if (mod_gen != mod && mod_gen != DRM_FORMAT_MOD_INVALID &&
+        mod_gen != DRM_FORMAT_MOD_LINEAR) {
+      g_value_set_uint64 (&gmod, mod_gen);
+      gst_value_list_append_value (modifiers, &gmod);
+    }
+  }
+
+  if (mod == DRM_FORMAT_MOD_LINEAR || mod_gen == DRM_FORMAT_MOD_LINEAR) {
+    g_value_set_uint64 (&gmod, DRM_FORMAT_MOD_LINEAR);
+    gst_value_list_append_value (modifiers, &gmod);
+  }
+
+  if (mod == DRM_FORMAT_MOD_INVALID && mod_gen == DRM_FORMAT_MOD_INVALID) {
+    GST_WARNING ("Failed to get modifier %s:0x%016llx",
+        gst_video_format_to_string (fmt), DRM_FORMAT_MOD_INVALID);
+
+    g_value_set_uint64 (&gmod, DRM_FORMAT_MOD_INVALID);
+    gst_value_list_append_value (modifiers, &gmod);
+  }
+
+  g_value_unset (&gmod);
+}
+
+static const gchar *
+_drm_format_to_string (const gchar * fmt_str, guint64 modifier)
+{
+  if (modifier == DRM_FORMAT_MOD_INVALID)
+    return NULL;
+
+  if (modifier == DRM_FORMAT_MOD_LINEAR)
+    return fmt_str;
+
+  return g_strdup_printf ("%s:0x%016lx", fmt_str, modifier);
+}
+
+static gboolean
+_dma_fmt_to_drm_fmts (GstMsdkContext * context,
+    guint usage_hint, const GValue * dma_fmts, GValue * drm_fmts)
+{
+  const gchar *fmt_str;
+  const gchar *drm_fmt_str;
+  GstVideoFormat fmt;
+  GValue mods = G_VALUE_INIT;
+
+  if (!dma_fmts)
+    return FALSE;
+
+  fmt_str = g_value_get_string (dma_fmts);
+  fmt = gst_video_format_from_string (fmt_str);
+  if (fmt == GST_VIDEO_FORMAT_UNKNOWN)
+    return FALSE;
+
+  g_value_init (&mods, GST_TYPE_LIST);
+  _get_modifiers (context, usage_hint, fmt, &mods);
+
+  for (gint m = 0; m < gst_value_list_get_size (&mods); m++) {
+    const GValue *gmod = gst_value_list_get_value (&mods, m);
+    guint64 mod = g_value_get_uint64 (gmod);
+
+    drm_fmt_str = _drm_format_to_string (fmt_str, mod);
+    if (!drm_fmt_str)
+      continue;
+
+    _list_append_string (drm_fmts, drm_fmt_str);
+
+    GST_DEBUG ("Got mofidier: %s", drm_fmt_str);
+  }
+  g_value_unset (&mods);
+
+  return TRUE;
+}
+
+static gboolean
+_dma_fmts_to_drm_fmts (GstMsdkContext * context,
+    guint usage_hint, const GValue * dma_fmts, GValue * drm_fmts)
+{
+  gint size = gst_value_list_get_size (dma_fmts);
+
+  for (gint f = 0; f < size; f++) {
+    const GValue *dma_fmt = gst_value_list_get_value (dma_fmts, f);
+    if (!dma_fmt)
+      continue;
+
+    _dma_fmt_to_drm_fmts (context, usage_hint, dma_fmt, drm_fmts);
+  }
+
+  return TRUE;
+}
+
+static guint
+_get_usage_hint (GstMsdkContextJobType job_type)
+{
+  guint hint = VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC;
+
+  switch (job_type) {
+    case GST_MSDK_JOB_DECODER:
+      hint |= VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
+      break;
+    case GST_MSDK_JOB_ENCODER:
+      hint |= VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER;
+      break;
+    case GST_MSDK_JOB_VPP:
+      hint |= VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ |
+          VA_SURFACE_ATTRIB_USAGE_HINT_VPP_WRITE;
+      break;
+    default:
+      GST_WARNING ("Unsupported job type %d", job_type);
+      break;
+  }
+
+  return hint;
+}
+
+static GstCaps *
+_create_dma_drm_caps (GstMsdkContext * context,
+    GstMsdkContextJobType job_type, const GValue * dma_fmts)
+{
+  GstCaps *drm_caps;
+  GValue drm_fmts = G_VALUE_INIT;
+  guint usage_hint;
+
+  usage_hint = _get_usage_hint (job_type);
+
+  g_value_init (&drm_fmts, GST_TYPE_LIST);
+  if (G_VALUE_HOLDS_STRING (dma_fmts)) {
+    _dma_fmt_to_drm_fmts (context, usage_hint, dma_fmts, &drm_fmts);
+  } else if (GST_VALUE_HOLDS_LIST (dma_fmts)) {
+    _dma_fmts_to_drm_fmts (context, usage_hint, dma_fmts, &drm_fmts);
+  }
+
+  if (!gst_value_list_get_size (&drm_fmts)) {
+    g_value_unset (&drm_fmts);
+    return NULL;
+  }
+
+  drm_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
+  gst_caps_set_value (drm_caps, "drm-format", &drm_fmts);
+  g_value_unset (&drm_fmts);
+
+  return drm_caps;
 }
 
 #if (MFX_VERSION >= 2000)
@@ -340,7 +554,7 @@ _codec_init_param (mfxVideoParam * param,
 }
 
 static gboolean
-_get_min_width (MsdkSession * session, mfxVideoParam * in,
+_get_min_width (mfxSession * session, mfxVideoParam * in,
     mfxVideoParam * out, IsParamSupportedFunc func,
     const mfxRange32U * width, guint * min_w)
 {
@@ -376,7 +590,7 @@ _get_min_width (MsdkSession * session, mfxVideoParam * in,
 }
 
 static gboolean
-_get_min_height (MsdkSession * session, mfxVideoParam * in,
+_get_min_height (mfxSession * session, mfxVideoParam * in,
     mfxVideoParam * out, IsParamSupportedFunc func,
     const mfxRange32U * height, guint * min_h)
 {
@@ -425,7 +639,7 @@ _get_smaller_res_width (guint cur_res_width)
 }
 
 static gboolean
-_get_max_width (MsdkSession * session, mfxVideoParam * in,
+_get_max_width (mfxSession * session, mfxVideoParam * in,
     mfxVideoParam * out, IsParamSupportedFunc func,
     const mfxRange32U * width, guint * max_w)
 {
@@ -477,7 +691,7 @@ _get_smaller_res_height (guint cur_res_height)
 }
 
 static gboolean
-_get_max_height (MsdkSession * session, mfxVideoParam * in,
+_get_max_height (mfxSession * session, mfxVideoParam * in,
     mfxVideoParam * out, IsParamSupportedFunc func,
     const mfxRange32U * height, guint * max_h)
 {
@@ -548,10 +762,10 @@ _fourcc_in_array (mfxU32 fourcc, mfxU32 * array, mfxU16 num)
 }
 
 static inline gboolean
-_enc_is_param_supported (MsdkSession * session,
+_enc_is_param_supported (mfxSession * session,
     mfxVideoParam * in, mfxVideoParam * out)
 {
-  mfxStatus status = MFXVideoENCODE_Query (session->session, in, out);
+  mfxStatus status = MFXVideoENCODE_Query (*session, in, out);
   if (status == MFX_ERR_NONE)
     return TRUE;
 
@@ -595,7 +809,7 @@ failed:
 }
 
 static gboolean
-_enc_get_resolution_range (MsdkSession * session,
+_enc_get_resolution_range (mfxSession * session,
     mfxEncoderDescription * enc_desc, guint codec_id,
     ResolutionRange * res_range)
 {
@@ -638,7 +852,7 @@ _enc_get_resolution_range (MsdkSession * session,
 }
 
 static gboolean
-_enc_is_format_supported (MsdkSession * session,
+_enc_is_format_supported (mfxSession * session,
     guint codec_id, GstVideoFormat format,
     mfxVideoParam * in, mfxVideoParam * out)
 {
@@ -658,7 +872,7 @@ _enc_is_format_supported (MsdkSession * session,
 }
 
 static gboolean
-_enc_get_supported_formats_and_profiles (MsdkSession * session,
+_enc_get_supported_formats_and_profiles (mfxSession * session,
     mfxEncoderDescription * enc_desc, guint codec_id,
     GValue * supported_fmts, GValue * supported_profs)
 {
@@ -738,7 +952,7 @@ _enc_get_supported_formats_and_profiles (MsdkSession * session,
 }
 
 static GstCaps *
-_enc_create_sink_caps (MsdkSession * session, guint codec_id,
+_enc_create_sink_caps (GstMsdkContext * context, guint codec_id,
     const ResolutionRange * res, GValue * supported_formats)
 {
   GstCaps *caps, *dma_caps;
@@ -747,8 +961,8 @@ _enc_create_sink_caps (MsdkSession * session, guint codec_id,
   gst_caps_set_value (caps, "format", supported_formats);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_formats);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_ENCODER,
+      supported_formats);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -773,8 +987,8 @@ _enc_create_sink_caps (MsdkSession * session, guint codec_id,
 }
 
 static GstCaps *
-_enc_create_src_caps (MsdkSession * session,
-    guint codec_id, const ResolutionRange * res, GValue * supported_profiles)
+_enc_create_src_caps (guint codec_id,
+    const ResolutionRange * res, GValue * supported_profiles)
 {
   GstCaps *caps;
   const gchar *media_type = NULL;
@@ -796,7 +1010,7 @@ _enc_create_src_caps (MsdkSession * session,
 }
 
 gboolean
-gst_msdkcaps_enc_create_caps (MsdkSession * session,
+gst_msdkcaps_enc_create_caps (GstMsdkContext * context,
     gpointer enc_description, guint codec_id,
     GstCaps ** sink_caps, GstCaps ** src_caps)
 {
@@ -805,10 +1019,12 @@ gst_msdkcaps_enc_create_caps (MsdkSession * session,
   ResolutionRange res_range = { 1, G_MAXUINT16, 1, G_MAXUINT16 };
   GValue supported_fmts = G_VALUE_INIT;
   GValue supported_profs = G_VALUE_INIT;
+  mfxSession session;
 
-  g_return_val_if_fail (session, FALSE);
+  g_return_val_if_fail (context, FALSE);
   g_return_val_if_fail (enc_description, FALSE);
 
+  session = gst_msdk_context_get_session (context);
   enc_desc = (mfxEncoderDescription *) enc_description;
 
   if (_enc_get_codec_index (enc_desc, codec_id) < 0)
@@ -816,21 +1032,20 @@ gst_msdkcaps_enc_create_caps (MsdkSession * session,
 
   g_value_init (&supported_fmts, GST_TYPE_LIST);
   g_value_init (&supported_profs, GST_TYPE_LIST);
-  if (!_enc_get_supported_formats_and_profiles (session,
+  if (!_enc_get_supported_formats_and_profiles (&session,
           enc_desc, codec_id, &supported_fmts, &supported_profs))
     goto failed;
 
-  if (!_enc_get_resolution_range (session, enc_desc, codec_id, &res_range))
+  if (!_enc_get_resolution_range (&session, enc_desc, codec_id, &res_range))
     goto failed;
 
-  in_caps = _enc_create_sink_caps (session,
+  in_caps = _enc_create_sink_caps (context,
       codec_id, &res_range, &supported_fmts);
   g_value_unset (&supported_fmts);
   if (!in_caps)
     goto failed;
 
-  out_caps = _enc_create_src_caps (session,
-      codec_id, &res_range, &supported_profs);
+  out_caps = _enc_create_src_caps (codec_id, &res_range, &supported_profs);
   g_value_unset (&supported_profs);
   if (!out_caps)
     goto failed;
@@ -853,10 +1068,10 @@ failed:
 }
 
 static inline gboolean
-_dec_is_param_supported (MsdkSession * session,
+_dec_is_param_supported (mfxSession * session,
     mfxVideoParam * in, mfxVideoParam * out)
 {
-  mfxStatus status = MFXVideoDECODE_Query (session->session, in, out);
+  mfxStatus status = MFXVideoDECODE_Query (*session, in, out);
   if (status == MFX_ERR_NONE)
     return TRUE;
 
@@ -920,7 +1135,7 @@ _jpegdec_set_color_format (mfxVideoParam * param, GstVideoFormat format)
 }
 
 static gboolean
-_dec_get_resolution_range (MsdkSession * session,
+_dec_get_resolution_range (mfxSession * session,
     mfxDecoderDescription * dec_desc, guint codec_id,
     ResolutionRange * res_range)
 {
@@ -965,7 +1180,7 @@ _dec_get_resolution_range (MsdkSession * session,
 }
 
 static gboolean
-_dec_is_format_supported (MsdkSession * session,
+_dec_is_format_supported (mfxSession * session,
     guint codec_id, GstVideoFormat format,
     mfxVideoParam * in, mfxVideoParam * out)
 {
@@ -988,7 +1203,7 @@ _dec_is_format_supported (MsdkSession * session,
 }
 
 static gboolean
-_dec_get_supported_formats (MsdkSession * session,
+_dec_get_supported_formats (mfxSession * session,
     mfxDecoderDescription * dec_desc, guint codec_id, GValue * supported_fmts)
 {
   guint size;
@@ -1037,7 +1252,7 @@ _dec_get_supported_formats (MsdkSession * session,
 }
 
 static GstCaps *
-_dec_create_sink_caps (MsdkSession * session, guint codec_id)
+_dec_create_sink_caps (guint codec_id)
 {
   GstCaps *caps;
   const gchar *media_type = NULL;
@@ -1055,7 +1270,8 @@ _dec_create_sink_caps (MsdkSession * session, guint codec_id)
 }
 
 static GstCaps *
-_dec_create_src_caps (MsdkSession * session, guint codec_id,
+_dec_create_src_caps (GstMsdkContext * context,
+    mfxSession * session, guint codec_id,
     mfxDecoderDescription * dec_desc, GValue * supported_formats)
 {
   GstCaps *caps, *dma_caps;
@@ -1068,8 +1284,8 @@ _dec_create_src_caps (MsdkSession * session, guint codec_id,
   gst_caps_set_value (caps, "format", supported_formats);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_formats);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_DECODER,
+      supported_formats);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -1094,33 +1310,35 @@ _dec_create_src_caps (MsdkSession * session, guint codec_id,
 }
 
 gboolean
-gst_msdkcaps_dec_create_caps (MsdkSession * session,
+gst_msdkcaps_dec_create_caps (GstMsdkContext * context,
     gpointer dec_description, guint codec_id,
     GstCaps ** sink_caps, GstCaps ** src_caps)
 {
   mfxDecoderDescription *dec_desc;
   GstCaps *in_caps = NULL, *out_caps = NULL;
   GValue supported_fmts = G_VALUE_INIT;
+  mfxSession session;
 
-  g_return_val_if_fail (session, FALSE);
+  g_return_val_if_fail (context, FALSE);
   g_return_val_if_fail (dec_description, FALSE);
 
+  session = gst_msdk_context_get_session (context);
   dec_desc = (mfxDecoderDescription *) dec_description;
 
   if (_dec_get_codec_index (dec_desc, codec_id) < 0)
     goto failed;
 
   g_value_init (&supported_fmts, GST_TYPE_LIST);
-  if (!_dec_get_supported_formats (session,
+  if (!_dec_get_supported_formats (&session,
           dec_desc, codec_id, &supported_fmts))
     goto failed;
 
-  in_caps = _dec_create_sink_caps (session, codec_id);
+  in_caps = _dec_create_sink_caps (codec_id);
   if (!in_caps)
     goto failed;
 
-  out_caps = _dec_create_src_caps (session,
-      codec_id, dec_desc, &supported_fmts);
+  out_caps = _dec_create_src_caps (context,
+      &session, codec_id, dec_desc, &supported_fmts);
   g_value_unset (&supported_fmts);
   if (!out_caps)
     goto failed;
@@ -1166,10 +1384,10 @@ _vpp_init_param (mfxVideoParam * param,
 }
 
 static inline gboolean
-_vpp_is_param_supported (MsdkSession * session,
+_vpp_is_param_supported (mfxSession * session,
     mfxVideoParam * in, mfxVideoParam * out)
 {
-  mfxStatus status = MFXVideoVPP_Query (session->session, in, out);
+  mfxStatus status = MFXVideoVPP_Query (*session, in, out);
   if (status == MFX_ERR_NONE)
     return TRUE;
 
@@ -1177,7 +1395,7 @@ _vpp_is_param_supported (MsdkSession * session,
 }
 
 static gboolean
-_vpp_are_formats_supported (MsdkSession * session,
+_vpp_are_formats_supported (mfxSession * session,
     GstVideoFormat infmt, GstVideoFormat outfmt,
     mfxVideoParam * in, mfxVideoParam * out)
 {
@@ -1194,7 +1412,7 @@ _vpp_are_formats_supported (MsdkSession * session,
 }
 
 static gboolean
-_vpp_get_supported_formats (MsdkSession * session,
+_vpp_get_supported_formats (mfxSession * session,
     GValue * supported_in_fmts, GValue * supported_out_fmts)
 {
   guint size;
@@ -1268,7 +1486,7 @@ _vpp_get_desc_image_range (mfxVPPDescription * vpp_desc,
 }
 
 static gboolean
-_vpp_get_resolution_range (MsdkSession * session,
+_vpp_get_resolution_range (mfxSession * session,
     mfxVPPDescription * vpp_desc, ResolutionRange * res_range)
 {
   mfxVideoParam in, out;
@@ -1306,7 +1524,7 @@ _vpp_get_resolution_range (MsdkSession * session,
 }
 
 static GstCaps *
-_vpp_create_caps (MsdkSession * session,
+_vpp_create_caps (GstMsdkContext * context,
     GValue * supported_fmts, ResolutionRange * res)
 {
   GstCaps *caps, *dma_caps;
@@ -1315,8 +1533,7 @@ _vpp_create_caps (MsdkSession * session,
   gst_caps_set_value (caps, "format", supported_fmts);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_fmts);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_VPP, supported_fmts);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -1342,7 +1559,7 @@ _vpp_create_caps (MsdkSession * session,
 }
 
 gboolean
-gst_msdkcaps_vpp_create_caps (MsdkSession * session,
+gst_msdkcaps_vpp_create_caps (GstMsdkContext * context,
     gpointer vpp_description, GstCaps ** sink_caps, GstCaps ** src_caps)
 {
   mfxVPPDescription *vpp_desc;
@@ -1350,28 +1567,30 @@ gst_msdkcaps_vpp_create_caps (MsdkSession * session,
   GValue supported_in_fmts = G_VALUE_INIT;
   GValue supported_out_fmts = G_VALUE_INIT;
   ResolutionRange res_range = { 1, G_MAXUINT16, 1, G_MAXUINT16 };
+  mfxSession session;
 
-  g_return_val_if_fail (session, FALSE);
+  g_return_val_if_fail (context, FALSE);
   g_return_val_if_fail (vpp_description, FALSE);
 
+  session = gst_msdk_context_get_session (context);
   vpp_desc = (mfxVPPDescription *) vpp_description;
 
   g_value_init (&supported_in_fmts, GST_TYPE_LIST);
   g_value_init (&supported_out_fmts, GST_TYPE_LIST);
 
-  if (!_vpp_get_supported_formats (session,
+  if (!_vpp_get_supported_formats (&session,
           &supported_in_fmts, &supported_out_fmts))
     goto failed;
 
-  if (!_vpp_get_resolution_range (session, vpp_desc, &res_range))
+  if (!_vpp_get_resolution_range (&session, vpp_desc, &res_range))
     goto failed;
 
-  in_caps = _vpp_create_caps (session, &supported_in_fmts, &res_range);
+  in_caps = _vpp_create_caps (context, &supported_in_fmts, &res_range);
   g_value_unset (&supported_in_fmts);
   if (!in_caps)
     goto failed;
 
-  out_caps = _vpp_create_caps (session, &supported_out_fmts, &res_range);
+  out_caps = _vpp_create_caps (context, &supported_out_fmts, &res_range);
   g_value_unset (&supported_out_fmts);
   if (!out_caps)
     goto failed;
@@ -1475,16 +1694,17 @@ _enc_get_dma_formats (guint codec_id)
 #endif
 
 gboolean
-gst_msdkcaps_enc_create_caps (MsdkSession * session,
+gst_msdkcaps_enc_create_caps (GstMsdkContext * context,
     gpointer enc_description, guint codec_id,
     GstCaps ** sink_caps, GstCaps ** src_caps)
 {
   GstCaps *in_caps = NULL, *out_caps = NULL;
   GstCaps *dma_caps = NULL;
-  gchar *raw_caps_str, *dma_caps_str;
+  gchar *raw_caps_str;
   const gchar *media_type = NULL;
   const char *raw_fmts = NULL;
-  const char *dma_fmts = NULL;
+  const char *dma_fmts_str = NULL;
+  GValue dma_fmts = G_VALUE_INIT;
   GValue supported_profs = G_VALUE_INIT;
 
   raw_fmts = _enc_get_raw_formats (codec_id);
@@ -1496,21 +1716,23 @@ gst_msdkcaps_enc_create_caps (MsdkSession * session,
   g_free (raw_caps_str);
 
 #ifndef _WIN32
-  dma_fmts = _enc_get_dma_formats (codec_id);
-  if (!dma_fmts)
+  dma_fmts_str = _enc_get_dma_formats (codec_id);
+  if (!dma_fmts_str)
     goto failed;
-  dma_caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      dma_fmts);
-  dma_caps = gst_caps_from_string (dma_caps_str);
-  g_free (dma_caps_str);
+
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (dma_fmts_str, &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_ENCODER, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (in_caps, dma_caps);
 
   gst_caps_append (in_caps,
       gst_caps_from_string
       ("video/x-raw(memory:VAMemory), format=(string){ NV12 }"));
 #else
-  VAR_UNUSED (dma_caps_str);
+  VAR_UNUSED (dma_caps);
+  VAR_UNUSED (dma_fmts_str);
   VAR_UNUSED (dma_fmts);
   gst_caps_append (in_caps,
       gst_caps_from_string
@@ -1624,16 +1846,17 @@ _dec_get_dma_formats (guint codec_id)
 #endif
 
 gboolean
-gst_msdkcaps_dec_create_caps (MsdkSession * session,
+gst_msdkcaps_dec_create_caps (GstMsdkContext * context,
     gpointer dec_description, guint codec_id,
     GstCaps ** sink_caps, GstCaps ** src_caps)
 {
   GstCaps *in_caps = NULL, *out_caps = NULL;
   GstCaps *dma_caps = NULL;
-  gchar *raw_caps_str, *dma_caps_str;
+  gchar *raw_caps_str;
   const gchar *media_type = NULL;
   const char *raw_fmts = NULL;
-  const char *dma_fmts = NULL;
+  const char *dma_fmts_str = NULL;
+  GValue dma_fmts = G_VALUE_INIT;
 
   media_type = _get_media_type (codec_id);
   if (!media_type)
@@ -1650,21 +1873,23 @@ gst_msdkcaps_dec_create_caps (MsdkSession * session,
   g_free (raw_caps_str);
 
 #ifndef _WIN32
-  dma_fmts = _dec_get_dma_formats (codec_id);
-  if (!dma_fmts)
+  dma_fmts_str = _dec_get_dma_formats (codec_id);
+  if (!dma_fmts_str)
     goto failed;
-  dma_caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      dma_fmts);
-  dma_caps = gst_caps_from_string (dma_caps_str);
-  g_free (dma_caps_str);
+
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (dma_fmts_str, &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_DECODER, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (out_caps, dma_caps);
 
   gst_caps_append (out_caps,
       gst_caps_from_string
       ("video/x-raw(memory:VAMemory), format=(string){ NV12 }"));
 #else
-  VAR_UNUSED (dma_caps_str);
+  VAR_UNUSED (dma_caps);
+  VAR_UNUSED (dma_fmts_str);
   VAR_UNUSED (dma_fmts);
   gst_caps_append (out_caps,
       gst_caps_from_string
@@ -1735,10 +1960,11 @@ _vpp_get_dma_formats (GstPadDirection direction)
 #endif
 
 static GstCaps *
-_vpp_create_caps (GstPadDirection direction)
+_vpp_create_caps (GstMsdkContext * context, GstPadDirection direction)
 {
   GstCaps *caps = NULL, *dma_caps = NULL;
   gchar *caps_str;
+  GValue dma_fmts = G_VALUE_INIT;
 
   caps_str = g_strdup_printf ("video/x-raw, format=(string){ %s }",
       _vpp_get_raw_formats (direction));
@@ -1746,18 +1972,18 @@ _vpp_create_caps (GstPadDirection direction)
   g_free (caps_str);
 
 #ifndef _WIN32
-  caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      _vpp_get_dma_formats (direction));
-  dma_caps = gst_caps_from_string (caps_str);
-  g_free (caps_str);
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (_vpp_get_dma_formats (direction), &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_VPP, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps, gst_caps_from_string ("video/x-raw(memory:VAMemory), "
           "format=(string){ NV12, VUYA, P010_10LE }"));
 #else
   VAR_UNUSED (dma_caps);
-  VAR_UNUSED (caps_str);
+  VAR_UNUSED (dma_fmts);
 
   gst_caps_append (caps,
       gst_caps_from_string ("video/x-raw(memory:D3D11Memory), "
@@ -1776,11 +2002,11 @@ _vpp_create_caps (GstPadDirection direction)
 }
 
 gboolean
-gst_msdkcaps_vpp_create_caps (MsdkSession * session,
+gst_msdkcaps_vpp_create_caps (GstMsdkContext * context,
     gpointer vpp_description, GstCaps ** sink_caps, GstCaps ** src_caps)
 {
-  *sink_caps = _vpp_create_caps (GST_PAD_SINK);
-  *src_caps = _vpp_create_caps (GST_PAD_SRC);
+  *sink_caps = _vpp_create_caps (context, GST_PAD_SINK);
+  *src_caps = _vpp_create_caps (context, GST_PAD_SRC);
 
   return TRUE;
 }
@@ -1872,6 +2098,287 @@ gst_msdkcaps_remove_structure (GstCaps * caps, const gchar * features)
   for (guint i = 0; i < size; i++) {
     if (gst_caps_features_is_equal (f, gst_caps_get_features (caps, i)))
       gst_caps_remove_structure (caps, i);
+  }
+
+  return TRUE;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GstCaps *
+gst_msdkcaps_video_info_to_drm_caps (GstVideoInfo * info, guint64 modifier)
+{
+  GstVideoInfoDmaDrm drm_info;
+
+  gst_video_info_dma_drm_init (&drm_info);
+  drm_info.vinfo = *info;
+  drm_info.drm_fourcc =
+      gst_va_fourcc_from_video_format (GST_VIDEO_INFO_FORMAT (info));
+  drm_info.drm_modifier = modifier;
+
+  return gst_video_info_dma_drm_to_caps (&drm_info);
+}
+
+static gboolean
+_get_used_formats (GValue * used_fmts,
+    const GValue * fmt, const GValue * refer_fmts)
+{
+  const char *fmt_str;;
+  guint len;
+  guint size;
+  gboolean ret = FALSE;
+
+  if (!fmt || !refer_fmts)
+    return FALSE;
+
+  fmt_str = g_value_get_string (fmt);
+  len = strlen (fmt_str);
+  size = gst_value_list_get_size (refer_fmts);
+
+  for (guint i = 0; i < size; i++) {
+    const GValue *val = gst_value_list_get_value (refer_fmts, i);
+    const char *val_str = g_value_get_string (val);
+
+    if (strncmp (fmt_str, val_str, len) == 0) {
+      gst_value_list_append_value (used_fmts, val);
+      ret = TRUE;
+    }
+  }
+
+  return ret;
+}
+
+GstCaps *
+gst_msdkcaps_intersect (GstCaps * caps, GstCaps * refer_caps)
+{
+  GstStructure *dma_s = NULL;
+  const GValue *fmts = NULL;
+  GValue used_fmts = G_VALUE_INIT;
+  gboolean success = FALSE;
+  GstCaps *ret = gst_caps_copy (caps);
+  guint size = gst_caps_get_size (ret);
+
+  //ret = gst_caps_make_writable (ret);
+  for (guint i = 0; i < size; i++) {
+    const GValue *refer_fmts = NULL;
+    GstCapsFeatures *f = gst_caps_get_features (ret, i);
+    if (!gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF))
+      continue;
+
+    dma_s = gst_caps_get_structure (ret, i);
+    fmts = gst_structure_get_value (dma_s, "format");
+    if (!fmts)
+      continue;
+
+    for (guint j = 0; j < gst_caps_get_size (refer_caps); j++) {
+      GstCapsFeatures *ft = gst_caps_get_features (refer_caps, j);
+      if (!gst_caps_features_contains (ft, GST_CAPS_FEATURE_MEMORY_DMABUF))
+        continue;
+      refer_fmts =
+          gst_structure_get_value (gst_caps_get_structure (refer_caps, j),
+          "drm-format");
+    }
+    if (!refer_fmts)
+      continue;
+
+    g_value_init (&used_fmts, GST_TYPE_LIST);
+    if (G_VALUE_HOLDS_STRING (fmts)) {
+      success = _get_used_formats (&used_fmts, fmts, refer_fmts);
+    } else if (GST_VALUE_HOLDS_LIST (fmts)) {
+      guint n = gst_value_list_get_size (fmts);
+      for (guint k = 0; k < n; k++) {
+        const GValue *val = gst_value_list_get_value (fmts, k);
+        if (_get_used_formats (&used_fmts, val, refer_fmts))
+          success = TRUE;
+      }
+    }
+
+    if (success) {
+      gst_structure_set_value (dma_s, "drm-format", &used_fmts);
+      gst_structure_remove_field (dma_s, "format");
+    }
+
+    g_value_unset (&used_fmts);
+
+  }
+
+  ret = gst_caps_intersect (ret, refer_caps);
+
+  GST_DEBUG ("intersected caps: %" GST_PTR_FORMAT, ret);
+
+  return ret;
+}
+
+
+gboolean
+get_msdkcaps_fixate_format (GstCaps * caps, GstVideoFormat fmt)
+{
+  GValue gfmt = G_VALUE_INIT;
+  const gchar *fmt_str = gst_video_format_to_string (fmt);
+  guint size = gst_caps_get_size (caps);
+
+  g_value_init (&gfmt, G_TYPE_STRING);
+  g_value_set_string (&gfmt, fmt_str);
+
+  for (guint i = 0; i < size; i++) {
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+    GstStructure *s = gst_caps_get_structure (caps, i);
+
+    if (gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF)) {
+      GValue used_fmts = G_VALUE_INIT;
+      const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+
+      g_value_init (&used_fmts, GST_TYPE_LIST);
+      if (!_get_used_formats (&used_fmts, &gfmt, drm_fmts)) {
+        g_value_unset (&used_fmts);
+        goto failed;
+      }
+
+      gst_structure_set_value (s, "drm-format", &used_fmts);
+      g_value_unset (&used_fmts);
+
+      if (gst_structure_has_field (s, "format"))
+        gst_structure_remove_field (s, "format");
+    } else {
+      const GValue *fmts = gst_structure_get_value (s, "format");
+      if (!gst_value_can_intersect (&gfmt, fmts))
+        goto failed;
+
+      gst_structure_set_value (s, "format", &gfmt);
+    }
+  }
+
+  g_value_unset (&gfmt);
+
+  return TRUE;
+
+failed:
+  g_value_unset (&gfmt);
+  return FALSE;
+}
+
+guint64
+get_msdkcaps_get_modifier (const GstCaps * caps)
+{
+  guint64 modifier = DRM_FORMAT_MOD_INVALID;
+  guint size = gst_caps_get_size (caps);
+
+  for (guint i = 0; i < size; i++) {
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+
+    if (gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF)) {
+      GstStructure *s = gst_caps_get_structure (caps, i);
+      const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+      const gchar *drm_str = NULL;
+
+      if (!drm_fmts)
+        continue;
+
+      if (G_VALUE_HOLDS_STRING (drm_fmts))
+        drm_str = g_value_get_string (drm_fmts);
+      else if (GST_VALUE_HOLDS_LIST (drm_fmts)) {
+        const GValue *val = gst_value_list_get_value (drm_fmts, 0);
+        drm_str = g_value_get_string (val);
+      }
+
+      gst_video_dma_drm_fourcc_from_string (drm_str, &modifier);
+    }
+  }
+
+  GST_DEBUG ("got modifier: 0x%016lx", modifier);
+
+  return modifier;
+}
+
+static void
+_drm_format_get_format (GValue * fmts, const gchar * drm_fmt_str)
+{
+  gchar **tokens;
+
+  if (!drm_fmt_str || !GST_VALUE_HOLDS_LIST (fmts))
+    return;
+
+  tokens = g_strsplit (drm_fmt_str, ":", 0);
+  _list_append_string (fmts, tokens[0]);
+
+  g_strfreev (tokens);
+}
+
+gboolean
+get_msdkcaps_remove_drm_format (GstCaps * caps)
+{
+  guint size = gst_caps_get_size (caps);
+  GValue fmts = G_VALUE_INIT;
+
+  for (guint i = 0; i < size; i++) {
+    GstStructure *s = gst_caps_get_structure (caps, i);
+    const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+    const gchar *drm_str = NULL;
+
+    if (!drm_fmts)
+      continue;
+
+    if (gst_structure_has_field (s, "format")) {
+      gst_structure_remove_field (s, "drm-format");
+      continue;
+    }
+
+    g_value_init (&fmts, GST_TYPE_LIST);
+
+    if (G_VALUE_HOLDS_STRING (drm_fmts)) {
+      const GValue *val;
+      drm_str = g_value_get_string (drm_fmts);
+      _drm_format_get_format (&fmts, drm_str);
+
+      val = gst_value_list_get_value (&fmts, 0);
+      gst_structure_set_value (s, "format", val);
+    } else if (GST_VALUE_HOLDS_LIST (drm_fmts)) {
+      guint n = gst_value_list_get_size (drm_fmts);
+      for (guint j = 0; j < n; j++) {
+        const GValue *val = gst_value_list_get_value (&fmts, j);
+        drm_str = g_value_get_string (val);
+        _drm_format_get_format (&fmts, drm_str);
+      }
+
+      gst_structure_set_value (s, "format", &fmts);
+    }
+    g_value_unset (&fmts);
+
+    gst_structure_remove_field (s, "drm-format");
   }
 
   return TRUE;

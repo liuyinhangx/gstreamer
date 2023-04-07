@@ -30,7 +30,6 @@
  */
 
 #include "msdk.h"
-#include "gstmsdkcontext.h"
 
 GST_DEBUG_CATEGORY_EXTERN (gst_msdk_debug);
 #define GST_CAT_DEFAULT gst_msdk_debug
@@ -180,14 +179,14 @@ msdk_get_platform_codename (mfxSession session)
 #if (MFX_VERSION >= 2000)
 
 gpointer
-msdk_get_impl_description (MsdkSession * session)
+msdk_get_impl_description (const mfxLoader * loader, mfxU32 impl_idx)
 {
   mfxImplDescription *desc = NULL;
   mfxStatus status = MFX_ERR_NONE;
 
-  g_return_val_if_fail (session != NULL, NULL);
+  g_return_val_if_fail (loader != NULL, NULL);
 
-  status = MFXEnumImplementations (session->loader, session->impl_idx,
+  status = MFXEnumImplementations (*loader, impl_idx,
       MFX_IMPLCAPS_IMPLDESCSTRUCTURE, (mfxHDL *) & desc);
   if (status != MFX_ERR_NONE) {
     GST_ERROR ("Failed to get implementation description, %s",
@@ -199,14 +198,14 @@ msdk_get_impl_description (MsdkSession * session)
 }
 
 gboolean
-msdk_release_impl_description (MsdkSession * session, gpointer impl_desc)
+msdk_release_impl_description (const mfxLoader * loader, gpointer impl_desc)
 {
   mfxStatus status = MFX_ERR_NONE;
   mfxImplDescription *desc = (mfxImplDescription *) impl_desc;
 
-  g_return_val_if_fail (session != NULL, FALSE);
+  g_return_val_if_fail (loader != NULL, FALSE);
 
-  status = MFXDispReleaseImplDescription (session->loader, desc);
+  status = MFXDispReleaseImplDescription (*loader, desc);
   if (status != MFX_ERR_NONE)
     return FALSE;
 
@@ -319,13 +318,13 @@ msdk_init_msdk_session (mfxIMPL impl, mfxVersion * pver,
 #else
 
 gpointer
-msdk_get_impl_description (MsdkSession * session)
+msdk_get_impl_description (const mfxLoader * loader, mfxU32 impl_idx)
 {
   return NULL;
 }
 
 gboolean
-msdk_release_impl_description (MsdkSession * session, gpointer impl_desc)
+msdk_release_impl_description (const mfxLoader * loader, gpointer impl_desc)
 {
   return TRUE;
 }
@@ -439,8 +438,7 @@ failed:
 gboolean
 msdk_is_available (void)
 {
-  /* Make sure we can create GstMsdkContext instance (the job type is not used actually) */
-  GstMsdkContext *msdk_context = gst_msdk_context_new (1, GST_MSDK_JOB_DECODER);
+  GstMsdkContext *msdk_context = gst_msdk_context_new (TRUE);
 
   if (!msdk_context) {
     return FALSE;

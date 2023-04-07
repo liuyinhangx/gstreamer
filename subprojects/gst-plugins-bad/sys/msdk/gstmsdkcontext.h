@@ -87,7 +87,9 @@ struct _GstMsdkContextClass
 
 GType gst_msdk_context_get_type (void);
 
-GstMsdkContext * gst_msdk_context_new (gboolean hardware, GstMsdkContextJobType job_type);
+GstMsdkContext * gst_msdk_context_new (gboolean hardware);
+GstMsdkContext * gst_msdk_context_new_with_job_type (gboolean hardware,
+    GstMsdkContextJobType job_type);
 GstMsdkContext * gst_msdk_context_new_with_parent (GstMsdkContext * parent);
 #ifndef _WIN32
 GstMsdkContext * gst_msdk_context_new_with_va_display (GstObject * display_obj,
@@ -97,6 +99,8 @@ GstMsdkContext * gst_msdk_context_new_with_d3d11_device (GstD3D11Device * device
     gboolean hardware, GstMsdkContextJobType job_type);
 #endif
 mfxSession gst_msdk_context_get_session (GstMsdkContext * context);
+const mfxLoader * gst_msdk_context_get_loader (GstMsdkContext * context);
+mfxU32 gst_msdk_context_get_impl_idx (GstMsdkContext * context);
 
 gpointer gst_msdk_context_get_handle (GstMsdkContext * context);
 #ifndef _WIN32
@@ -140,6 +144,10 @@ gst_msdk_context_get_alloc_pool (GstMsdkContext * context);
 
 GstMsdkContextJobType
 gst_msdk_context_get_job_type (GstMsdkContext * context);
+
+void
+gst_msdk_context_set_job_type (GstMsdkContext * context,
+    GstMsdkContextJobType job_type);
 
 void
 gst_msdk_context_add_job_type (GstMsdkContext * context, GstMsdkContextJobType job_type);

@@ -62,7 +62,8 @@ struct _GstMsdkAV1EncClass
 
 gboolean
 gst_msdkav1enc_register (GstPlugin * plugin,
-    MsdkSession * session, GstCaps * sink_caps, GstCaps * src_caps, guint rank);
+    GstMsdkContext * context, GstCaps * sink_caps,
+    GstCaps * src_caps, guint rank);
 
 G_END_DECLS
 
