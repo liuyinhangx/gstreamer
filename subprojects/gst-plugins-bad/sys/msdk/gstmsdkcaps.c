@@ -31,6 +31,11 @@
 
 #include "gstmsdkcaps.h"
 
+#include <libdrm/drm_fourcc.h>
+#include "msdk_libva.h"
+#include "gstmsdkallocator_libva.h"
+#include <gst/va/gstvavideoformat.h>
+
 #define DEFAULT_DELIMITER ", "
 #define PROFILE_DELIMITER DEFAULT_DELIMITER
 
@@ -214,6 +219,105 @@ _get_media_type (guint codec)
   }
 
   return NULL;
+}
+
+static const gchar *
+_dma_drm_format_to_string (const gchar * fmt_str, guint64 modifier)
+{
+  if (modifier == DRM_FORMAT_MOD_INVALID)
+    return NULL;
+
+  if (modifier == DRM_FORMAT_MOD_LINEAR)
+    return fmt_str;
+
+  return g_strdup_printf ("%s:0x%016lx", fmt_str, modifier);
+}
+
+static gboolean
+_dma_fmt_to_dma_drm_fmts (GstMsdkContext * context,
+    GstMsdkContextJobType job_type,
+    const GValue * dma_fmts, GValue * dma_drm_fmts)
+{
+  const gchar *fmt_str;
+  const gchar *drm_fmt_str;
+  GstVideoFormat fmt;
+  GValue gval = G_VALUE_INIT;
+  GValue mods = G_VALUE_INIT;
+
+  if (!dma_fmts)
+    return FALSE;
+
+  fmt_str = g_value_get_string (dma_fmts);
+  fmt = gst_video_format_from_string (fmt_str);
+  if (fmt == GST_VIDEO_FORMAT_UNKNOWN)
+    return FALSE;
+
+  g_value_init (&gval, G_TYPE_STRING);
+  g_value_init (&mods, GST_TYPE_LIST);
+  gst_msdk_get_supported_modifiers (context, job_type, fmt, &mods);
+
+  for (gint m = 0; m < gst_value_list_get_size (&mods); m++) {
+    const GValue *gmod = gst_value_list_get_value (&mods, m);
+    guint64 mod = g_value_get_uint64 (gmod);
+
+    drm_fmt_str = _dma_drm_format_to_string (fmt_str, mod);
+    if (!drm_fmt_str)
+      continue;
+
+    g_value_set_string (&gval, drm_fmt_str);
+    gst_value_list_append_value (dma_drm_fmts, &gval);
+
+    GST_DEBUG ("Got mofidier: %s", drm_fmt_str);
+  }
+  g_value_unset (&mods);
+  g_value_unset (&gval);
+
+  return TRUE;
+}
+
+static gboolean
+_dma_fmts_to_dma_drm_fmts (GstMsdkContext * context,
+    GstMsdkContextJobType job_type,
+    const GValue * dma_fmts, GValue * dma_drm_fmts)
+{
+  gint size = gst_value_list_get_size (dma_fmts);
+
+  for (gint f = 0; f < size; f++) {
+    const GValue *dma_fmt = gst_value_list_get_value (dma_fmts, f);
+    if (!dma_fmt)
+      continue;
+
+    _dma_fmt_to_dma_drm_fmts (context, job_type, dma_fmt, dma_drm_fmts);
+  }
+
+  return TRUE;
+}
+
+static GstCaps *
+_create_dma_drm_caps (GstMsdkContext * context,
+    GstMsdkContextJobType job_type, const GValue * dma_formats)
+{
+  GstCaps *dma_drm_caps = NULL;
+  GValue dma_drm_fmts = G_VALUE_INIT;
+
+  g_return_val_if_fail (context != NULL, FALSE);
+  g_return_val_if_fail (dma_formats != NULL, FALSE);
+
+  g_value_init (&dma_drm_fmts, GST_TYPE_LIST);
+
+  if (GST_VALUE_HOLDS_LIST (dma_formats))
+    _dma_fmts_to_dma_drm_fmts (context, job_type, dma_formats, &dma_drm_fmts);
+  else if (G_VALUE_HOLDS_STRING (dma_formats))
+    _dma_fmt_to_dma_drm_fmts (context, job_type, dma_formats, &dma_drm_fmts);
+
+  if (gst_value_list_get_size (&dma_drm_fmts) > 0) {
+    dma_drm_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
+    gst_caps_set_value (dma_drm_caps, "drm-format", &dma_drm_fmts);
+  }
+
+  g_value_unset (&dma_drm_fmts);
+
+  return dma_drm_caps;
 }
 
 #if (MFX_VERSION >= 2000)
@@ -753,8 +857,8 @@ _enc_create_sink_caps (GstMsdkContext * context, guint codec_id,
   gst_caps_set_value (caps, "format", supported_formats);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_formats);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_ENCODER,
+      supported_formats);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -1076,8 +1180,8 @@ _dec_create_src_caps (GstMsdkContext * context,
   gst_caps_set_value (caps, "format", supported_formats);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_formats);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_DECODER,
+      supported_formats);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -1325,8 +1429,7 @@ _vpp_create_caps (GstMsdkContext * context,
   gst_caps_set_value (caps, "format", supported_fmts);
 
 #ifndef _WIN32
-  dma_caps = gst_caps_from_string ("video/x-raw(memory:DMABuf)");
-  gst_caps_set_value (dma_caps, "format", supported_fmts);
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_VPP, supported_fmts);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps,
@@ -1520,10 +1623,11 @@ gst_msdkcaps_enc_create_static_caps (GstMsdkContext * context,
 {
   GstCaps *in_caps = NULL, *out_caps = NULL;
   GstCaps *dma_caps = NULL;
-  gchar *raw_caps_str, *dma_caps_str;
+  gchar *raw_caps_str;
   const gchar *media_type = NULL;
   const char *raw_fmts = NULL;
-  const char *dma_fmts = NULL;
+  const char *dma_fmts_str = NULL;
+  GValue dma_fmts = G_VALUE_INIT;
   GValue supported_profs = G_VALUE_INIT;
 
   raw_fmts = _enc_get_static_raw_formats (codec_id);
@@ -1535,21 +1639,23 @@ gst_msdkcaps_enc_create_static_caps (GstMsdkContext * context,
   g_free (raw_caps_str);
 
 #ifndef _WIN32
-  dma_fmts = _enc_get_static_dma_formats (codec_id);
-  if (!dma_fmts)
+  dma_fmts_str = _enc_get_static_dma_formats (codec_id);
+  if (!dma_fmts_str)
     goto failed;
-  dma_caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      dma_fmts);
-  dma_caps = gst_caps_from_string (dma_caps_str);
-  g_free (dma_caps_str);
+
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (dma_fmts_str, &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_ENCODER, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (in_caps, dma_caps);
 
   gst_caps_append (in_caps,
       gst_caps_from_string
       ("video/x-raw(memory:VAMemory), format=(string){ NV12 }"));
 #else
-  VAR_UNUSED (dma_caps_str);
+  VAR_UNUSED (dma_caps);
+  VAR_UNUSED (dma_fmts_str);
   VAR_UNUSED (dma_fmts);
   gst_caps_append (in_caps,
       gst_caps_from_string
@@ -1668,10 +1774,11 @@ gst_msdkcaps_dec_create_static_caps (GstMsdkContext * context,
 {
   GstCaps *in_caps = NULL, *out_caps = NULL;
   GstCaps *dma_caps = NULL;
-  gchar *raw_caps_str, *dma_caps_str;
+  gchar *raw_caps_str;
   const gchar *media_type = NULL;
   const char *raw_fmts = NULL;
-  const char *dma_fmts = NULL;
+  const char *dma_fmts_str = NULL;
+  GValue dma_fmts = G_VALUE_INIT;
 
   media_type = _get_media_type (codec_id);
   if (!media_type)
@@ -1688,21 +1795,23 @@ gst_msdkcaps_dec_create_static_caps (GstMsdkContext * context,
   g_free (raw_caps_str);
 
 #ifndef _WIN32
-  dma_fmts = _dec_get_static_dma_formats (codec_id);
-  if (!dma_fmts)
+  dma_fmts_str = _dec_get_static_dma_formats (codec_id);
+  if (!dma_fmts_str)
     goto failed;
-  dma_caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      dma_fmts);
-  dma_caps = gst_caps_from_string (dma_caps_str);
-  g_free (dma_caps_str);
+
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (dma_fmts_str, &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_DECODER, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (out_caps, dma_caps);
 
   gst_caps_append (out_caps,
       gst_caps_from_string
       ("video/x-raw(memory:VAMemory), format=(string){ NV12 }"));
 #else
-  VAR_UNUSED (dma_caps_str);
+  VAR_UNUSED (dma_caps);
+  VAR_UNUSED (dma_fmts_str);
   VAR_UNUSED (dma_fmts);
   gst_caps_append (out_caps,
       gst_caps_from_string
@@ -1777,6 +1886,7 @@ _vpp_create_static_caps (GstMsdkContext * context, GstPadDirection direction)
 {
   GstCaps *caps = NULL, *dma_caps = NULL;
   gchar *caps_str;
+  GValue dma_fmts = G_VALUE_INIT;
 
   caps_str = g_strdup_printf ("video/x-raw, format=(string){ %s }",
       _vpp_get_static_raw_formats (direction));
@@ -1784,18 +1894,18 @@ _vpp_create_static_caps (GstMsdkContext * context, GstPadDirection direction)
   g_free (caps_str);
 
 #ifndef _WIN32
-  caps_str =
-      g_strdup_printf ("video/x-raw(memory:DMABuf), format=(string){ %s }",
-      _vpp_get_static_dma_formats (direction));
-  dma_caps = gst_caps_from_string (caps_str);
-  g_free (caps_str);
+  g_value_init (&dma_fmts, GST_TYPE_LIST);
+  _strings_to_list (_vpp_get_static_dma_formats (direction), &dma_fmts);
+
+  dma_caps = _create_dma_drm_caps (context, GST_MSDK_JOB_VPP, &dma_fmts);
+  g_value_unset (&dma_fmts);
   gst_caps_append (caps, dma_caps);
 
   gst_caps_append (caps, gst_caps_from_string ("video/x-raw(memory:VAMemory), "
           "format=(string){ NV12, VUYA, P010_10LE }"));
 #else
   VAR_UNUSED (dma_caps);
-  VAR_UNUSED (caps_str);
+  VAR_UNUSED (dma_fmts);
 
   gst_caps_append (caps,
       gst_caps_from_string ("video/x-raw(memory:D3D11Memory), "
@@ -1908,6 +2018,280 @@ gst_msdkcaps_remove_structure (GstCaps * caps, const gchar * features)
   for (guint i = 0; i < size; i++) {
     if (gst_caps_features_is_equal (f, gst_caps_get_features (caps, i)))
       gst_caps_remove_structure (caps, i);
+  }
+
+  return TRUE;
+}
+
+GstCaps *
+gst_msdkcaps_video_info_to_drm_caps (GstVideoInfo * info, guint64 modifier)
+{
+  GstVideoInfoDmaDrm drm_info;
+
+  gst_video_info_dma_drm_init (&drm_info);
+  drm_info.vinfo = *info;
+  drm_info.drm_fourcc =
+      gst_va_fourcc_from_video_format (GST_VIDEO_INFO_FORMAT (info));
+  drm_info.drm_modifier = modifier;
+
+  return gst_video_info_dma_drm_to_caps (&drm_info);
+}
+
+gboolean
+gst_msdkcaps_video_info_from_caps (const GstCaps * caps,
+    GstVideoInfo * info, guint64 * modifier)
+{
+  g_return_val_if_fail (caps != NULL, FALSE);
+  g_return_val_if_fail (info != NULL, FALSE);
+
+  if (gst_video_is_dma_drm_caps (caps)) {
+    GstVideoInfoDmaDrm *drm_info = gst_video_info_dma_drm_new_from_caps (caps);
+    if (!drm_info)
+      goto failed;
+
+    *info = drm_info->vinfo;
+    if (modifier)
+      *modifier = drm_info->drm_modifier;
+
+    gst_video_info_dma_drm_free (drm_info);
+  } else if (!gst_video_info_from_caps (info, caps))
+    goto failed;
+
+  return TRUE;
+
+failed:
+  GST_WARNING ("Failed to get video info");
+  return FALSE;
+}
+
+static gboolean
+_get_used_formats (GValue * used_fmts,
+    const GValue * fmt, const GValue * refer_fmts)
+{
+  const char *fmt_str;;
+  guint len;
+  guint size;
+  gboolean ret = FALSE;
+
+  if (!fmt || !refer_fmts)
+    return FALSE;
+
+  fmt_str = g_value_get_string (fmt);
+  len = strlen (fmt_str);
+  size = gst_value_list_get_size (refer_fmts);
+
+  for (guint i = 0; i < size; i++) {
+    const GValue *val = gst_value_list_get_value (refer_fmts, i);
+    const char *val_str = g_value_get_string (val);
+
+    if (strncmp (fmt_str, val_str, len) == 0) {
+      gst_value_list_append_value (used_fmts, val);
+      ret = TRUE;
+    }
+  }
+
+  return ret;
+}
+
+GstCaps *
+gst_msdkcaps_intersect (GstCaps * caps, GstCaps * refer_caps)
+{
+  GstStructure *dma_s = NULL;
+  const GValue *fmts = NULL;
+  GValue used_fmts = G_VALUE_INIT;
+  gboolean success = FALSE;
+  GstCaps *ret = gst_caps_copy (caps);
+  guint size = gst_caps_get_size (ret);
+
+  //ret = gst_caps_make_writable (ret);
+  for (guint i = 0; i < size; i++) {
+    const GValue *refer_fmts = NULL;
+    GstCapsFeatures *f = gst_caps_get_features (ret, i);
+    if (!gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF))
+      continue;
+
+    dma_s = gst_caps_get_structure (ret, i);
+    fmts = gst_structure_get_value (dma_s, "format");
+    if (!fmts)
+      continue;
+
+    for (guint j = 0; j < gst_caps_get_size (refer_caps); j++) {
+      GstCapsFeatures *ft = gst_caps_get_features (refer_caps, j);
+      if (!gst_caps_features_contains (ft, GST_CAPS_FEATURE_MEMORY_DMABUF))
+        continue;
+      refer_fmts =
+          gst_structure_get_value (gst_caps_get_structure (refer_caps, j),
+          "drm-format");
+    }
+    if (!refer_fmts)
+      continue;
+
+    g_value_init (&used_fmts, GST_TYPE_LIST);
+    if (G_VALUE_HOLDS_STRING (fmts)) {
+      success = _get_used_formats (&used_fmts, fmts, refer_fmts);
+    } else if (GST_VALUE_HOLDS_LIST (fmts)) {
+      guint n = gst_value_list_get_size (fmts);
+      for (guint k = 0; k < n; k++) {
+        const GValue *val = gst_value_list_get_value (fmts, k);
+        if (_get_used_formats (&used_fmts, val, refer_fmts))
+          success = TRUE;
+      }
+    }
+
+    if (success) {
+      gst_structure_set_value (dma_s, "drm-format", &used_fmts);
+      gst_structure_remove_field (dma_s, "format");
+    }
+
+    g_value_unset (&used_fmts);
+
+  }
+
+  ret = gst_caps_intersect (ret, refer_caps);
+
+  GST_DEBUG ("intersected caps: %" GST_PTR_FORMAT, ret);
+
+  return ret;
+}
+
+
+gboolean
+get_msdkcaps_fixate_format (GstCaps * caps, GstVideoFormat fmt)
+{
+  GValue gfmt = G_VALUE_INIT;
+
+  g_return_val_if_fail (caps != NULL, FALSE);
+  g_return_val_if_fail (gst_caps_is_writable (caps), FALSE);
+  g_return_val_if_fail (fmt != GST_VIDEO_FORMAT_UNKNOWN, FALSE);
+
+  g_value_init (&gfmt, G_TYPE_STRING);
+  g_value_set_string (&gfmt, gst_video_format_to_string (fmt));
+
+  for (guint i = 0; i < gst_caps_get_size (caps); i++) {
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+    GstStructure *s = gst_caps_get_structure (caps, i);
+
+    if (gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF)) {
+      GValue used_fmts = G_VALUE_INIT;
+      const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+
+      g_value_init (&used_fmts, GST_TYPE_LIST);
+      if (!_get_used_formats (&used_fmts, &gfmt, drm_fmts)) {
+        g_value_unset (&used_fmts);
+        goto failed;
+      }
+
+      gst_structure_set_value (s, "drm-format", &used_fmts);
+      g_value_unset (&used_fmts);
+
+      if (gst_structure_has_field (s, "format"))
+        gst_structure_remove_field (s, "format");
+    } else {
+      const GValue *fmts = gst_structure_get_value (s, "format");
+      if (!gst_value_can_intersect (&gfmt, fmts))
+        goto failed;
+
+      gst_structure_set_value (s, "format", &gfmt);
+    }
+  }
+
+  g_value_unset (&gfmt);
+
+  return TRUE;
+
+failed:
+  g_value_unset (&gfmt);
+  return FALSE;
+}
+
+guint64
+get_msdkcaps_get_modifier (const GstCaps * caps)
+{
+  guint64 modifier = DRM_FORMAT_MOD_INVALID;
+  guint size = gst_caps_get_size (caps);
+
+  for (guint i = 0; i < size; i++) {
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+
+    if (gst_caps_features_contains (f, GST_CAPS_FEATURE_MEMORY_DMABUF)) {
+      GstStructure *s = gst_caps_get_structure (caps, i);
+      const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+      const gchar *drm_str = NULL;
+
+      if (!drm_fmts)
+        continue;
+
+      if (G_VALUE_HOLDS_STRING (drm_fmts))
+        drm_str = g_value_get_string (drm_fmts);
+      else if (GST_VALUE_HOLDS_LIST (drm_fmts)) {
+        const GValue *val = gst_value_list_get_value (drm_fmts, 0);
+        drm_str = g_value_get_string (val);
+      }
+
+      gst_video_dma_drm_fourcc_from_string (drm_str, &modifier);
+    }
+  }
+
+  GST_DEBUG ("got modifier: 0x%016lx", modifier);
+
+  return modifier;
+}
+
+static void
+_drm_format_get_format (GValue * fmts, const gchar * drm_fmt_str)
+{
+  gchar **tokens;
+
+  if (!drm_fmt_str || !GST_VALUE_HOLDS_LIST (fmts))
+    return;
+
+  tokens = g_strsplit (drm_fmt_str, ":", 0);
+  _list_append_string (fmts, tokens[0]);
+
+  g_strfreev (tokens);
+}
+
+gboolean
+get_msdkcaps_remove_drm_format (GstCaps * caps)
+{
+  guint size = gst_caps_get_size (caps);
+  GValue fmts = G_VALUE_INIT;
+
+  for (guint i = 0; i < size; i++) {
+    GstStructure *s = gst_caps_get_structure (caps, i);
+    const GValue *drm_fmts = gst_structure_get_value (s, "drm-format");
+    const gchar *drm_str = NULL;
+
+    if (!drm_fmts)
+      continue;
+
+    if (gst_structure_has_field (s, "format")) {
+      gst_structure_remove_field (s, "drm-format");
+      continue;
+    }
+
+    g_value_init (&fmts, GST_TYPE_LIST);
+
+    if (G_VALUE_HOLDS_STRING (drm_fmts)) {
+      const GValue *val;
+      drm_str = g_value_get_string (drm_fmts);
+      _drm_format_get_format (&fmts, drm_str);
+
+      val = gst_value_list_get_value (&fmts, 0);
+      gst_structure_set_value (s, "format", val);
+    } else if (GST_VALUE_HOLDS_LIST (drm_fmts)) {
+      guint n = gst_value_list_get_size (drm_fmts);
+      for (guint j = 0; j < n; j++) {
+        const GValue *val = gst_value_list_get_value (&fmts, j);
+        drm_str = g_value_get_string (val);
+        _drm_format_get_format (&fmts, drm_str);
+      }
+
+      gst_structure_set_value (s, "format", &fmts);
+    }
+    g_value_unset (&fmts);
+
+    gst_structure_remove_field (s, "drm-format");
   }
 
   return TRUE;

@@ -341,7 +341,8 @@ gst_video_info_dma_drm_from_caps (GstVideoInfoDmaDrm * drm_info,
   /* TODO: Some well known tiled format such as NV12_4L4, NV12_16L16,
    * NV12_64Z32, NV12_16L32S */
   format = gst_video_dma_drm_fourcc_to_format (fourcc);
-  if (modifier == DRM_FORMAT_MOD_LINEAR && format != GST_VIDEO_FORMAT_UNKNOWN) {
+  // if (modifier == DRM_FORMAT_MOD_LINEAR && format != GST_VIDEO_FORMAT_UNKNOWN) {
+  if (format != GST_VIDEO_FORMAT_UNKNOWN) {
     gst_structure_set (structure, "format", G_TYPE_STRING,
         gst_video_format_to_string (format), NULL);
   } else {
@@ -383,10 +384,10 @@ gst_video_info_dma_drm_new_from_caps (const GstCaps * caps)
 {
   GstVideoInfoDmaDrm *ret;
 
-  g_return_val_if_fail (caps != NULL, FALSE);
+  g_return_val_if_fail (caps != NULL, NULL);
 
   if (!gst_video_is_dma_drm_caps (caps))
-    return FALSE;
+    return NULL;
 
   ret = gst_video_info_dma_drm_new ();
 
